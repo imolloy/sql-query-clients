@@ -14,20 +14,22 @@
 # limitations under the License.
 # ------------------------------------------------------------------------------
 
-import sys
-import urllib
 import json
+import sys
 import time
+import types
+import urllib
+import math
 import xml.etree.ElementTree as ET
+from datetime import datetime
+
+import ibm_boto3
+import pandas as pd
+from botocore.client import Config
+
 from tornado.escape import json_decode
 from tornado.httpclient import HTTPClient, HTTPError
 from tornado.httputil import HTTPHeaders
-import sys
-import types
-import pandas as pd
-from botocore.client import Config
-import ibm_boto3
-from datetime import datetime
 
 
 class SQLQuery():
@@ -142,12 +144,13 @@ class SQLQuery():
     def __iter__(self):
         return 0
 
-    def get_result(self, jobId):
+    def get_result(self, jobId, start_rec=0, end_rec=-1, fetch_byte_units=512, fetch_bytes=1024, index_column='monotonically_increasing_id()', header_bytes=1024):
         if not self.logged_on:
             print("You are not logged on to IBM Cloud")
             return
 
-        job_status = self.get_job(jobId)['status']
+        job_details = self.get_job(jobId)
+        job_status = job_details['status']
         if job_status == 'running':
             raise ValueError('SQL job with jobId {} still running. Come back later.')
         elif job_status != 'completed':
@@ -174,7 +177,7 @@ class SQLQuery():
             for contents in responseBodyXMLroot.findall('s3:Contents', ns):
                 key = contents.find('s3:Key', ns)
                 result_object = key.text
-                # print("Job result for {} stored at: {}".format(jobId, result_object))
+                print("Job result for {} stored at: {}".format(jobId, result_object))
         else:
             print("Result object listing for job {} at {} failed with http code {}".format(jobId, result_location,
                                                                                            response.code))
@@ -185,12 +188,57 @@ class SQLQuery():
                                       config=Config(signature_version='oauth'),
                                       endpoint_url='https://' + self.target_cos_endpoint)
 
-        body = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object)['Body']
+        object_meta = cos_client.head_object(Bucket=self.target_cos_bucket, Key=result_object)
+
+        num_bytes = object_meta['ContentLength']
+        bytes_per_rec = num_bytes / job_details['rows_returned']
+        start_bytes = start_rec * bytes_per_rec
+        end_bytes = (end_rec+1) * bytes_per_rec
+
+        start_fetch = int(math.floor(start_bytes / fetch_byte_units) * fetch_byte_units)
+        end_fetch = int((math.ceil(end_bytes / fetch_byte_units)) * fetch_byte_units)
+        if end_fetch == 0:
+            end_fetch = num_bytes
+        print("Byte Range %d:%d" % (start_fetch, end_fetch))
+
+        # Get the header from the CSV file
+        # It should be safe to break the first line on comma
+        if start_fetch > 0:
+            print("Fetching first block for header")
+            header = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object, Range="bytes=0-%d" % header_bytes)['Body'].read().decode('utf-8').split('\n')[0].split(',')
+
+        # print("Job result for {} stored at: {}".format(jobId, result_object))
+        if start_rec == 0 and end_rec == -1:
+            body = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object)['Body']
+            print("Fetching entire file")
+        else:
+            print("Fetching byte range %d-%d" % (start_fetch, end_fetch))
+            body = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object, Range="bytes=%d-%d" % (start_fetch, end_fetch))['Body']
+
         # add missing __iter__ method, so pandas accepts body as file-like object
         if not hasattr(body, "__iter__"): body.__iter__ = types.MethodType(self.__iter__, body)
+        
+        if start_fetch == 0:
+            result_df = pd.read_csv(body)
+        else:
+            print("Loading customer header and dropping first column")
+            result_df = pd.read_csv(body, header=None, names=header)
+        # if start_fetch > 0:
+            result_df.drop(result_df.index[[0]], inplace=True)
+        if end_fetch < num_bytes:
+            print("Dropping last column")
+            result_df.drop(result_df.index[[-1]], inplace=True)
 
-        result_df = pd.read_csv(body)
+        first_rec = int(result_df.iloc[0][index_column])
+        last_rec = int(result_df.iloc[-1][index_column])
 
+        cut_front = start_rec - first_rec
+        cut_back = end_rec - last_rec
+        print("Dropping columns: %d and %d" % (cut_front, cut_back))
+        if first_rec > 0:
+            result_df.drop(result_df.index[range(cut_front)], inplace=True)
+        if end_rec > 0:
+            result_df.drop(result_df.index[range(cut_back,0)], inplace=True)
         return result_df
 
     def delete_result(self, jobId):
