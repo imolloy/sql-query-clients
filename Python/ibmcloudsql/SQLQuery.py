@@ -204,43 +204,10 @@ class SQLQuery():
             start_fetch = 0
         print("Byte Range %d:%d" % (start_fetch, end_fetch))
 
-        # Get the header from the CSV file
-        # It should be safe to break the first line on comma
-        if start_fetch > 0:
-            print("Fetching first block for header")
-            header = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object, Range="bytes=0-%d" % header_bytes)['Body'].read().decode('utf-8').split('\n')[0].split(',')
-
-        # print("Job result for {} stored at: {}".format(jobId, result_object))
-        if start_rec == 0 and end_rec == -1:
-            body = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object)['Body']
-            print("Fetching entire file")
-        else:
-            print("Fetching byte range %d-%d" % (start_fetch, end_fetch))
-            body = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object, Range="bytes=%d-%d" % (start_fetch, end_fetch))['Body']
-
-        # add missing __iter__ method, so pandas accepts body as file-like object
-        if not hasattr(body, "__iter__"): body.__iter__ = types.MethodType(self.__iter__, body)
-        
-        if start_fetch == 0:
-            result_df = pd.read_csv(body)
-        else:
-            print("Loading customer header and dropping first column")
-            result_df = pd.read_csv(body, header=None, names=header)
-            result_df.drop(result_df.index[[0]], inplace=True)
-        if end_fetch < num_bytes:
-            print("Dropping last column")
-            result_df.drop(result_df.index[[-1]], inplace=True)
-
-        first_rec = int(result_df.iloc[0][index_column])
-        last_rec = int(result_df.iloc[-1][index_column])
+        result_df, first_rec, last_rec = self.__get_result_internal(cos_client, result_object, start_rec, end_rec, start_fetch, end_fetch, num_bytes, None, index_column, header_bytes)
 
         cut_front = start_rec - first_rec
         cut_back = end_rec - last_rec
-        print("Dropping rows: %d and %d" % (cut_front, cut_back))
-        if first_rec > 0:
-            result_df.drop(result_df.index[range(cut_front)], inplace=True)
-        if end_rec > 0:
-            result_df.drop(result_df.index[range(cut_back,0)], inplace=True)
         print("Have records %d to %d" % (first_rec, last_rec))
         old_end_fetch = end_fetch
         old_start_fetch = start_fetch
@@ -266,7 +233,10 @@ class SQLQuery():
             result_df = result_df.append(next_df)
         return result_df
 
-    def __get_result_internal(self, cos_client, result_object, start_rec, end_rec, start_fetch, end_fetch, num_bytes, header, index_column):
+    def __get_result_internal(self, cos_client, result_object, start_rec, end_rec, start_fetch, end_fetch, num_bytes, header, index_column, header_bytes=1024):
+        if start_fetch > 0 and header is None:
+            print("Fetching first block for header")
+            header = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object, Range="bytes=0-%d" % header_bytes)['Body'].read().decode('utf-8').split('\n')[0].split(',')
         print("Fetching byte range %d-%d" % (start_fetch, end_fetch))
         body = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object, Range="bytes=%d-%d" % (start_fetch, end_fetch))['Body']
         if not hasattr(body, "__iter__"): body.__iter__ = types.MethodType(self.__iter__, body)
