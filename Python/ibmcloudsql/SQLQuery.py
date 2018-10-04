@@ -199,6 +199,9 @@ class SQLQuery():
         end_fetch = int((math.ceil(end_bytes / fetch_byte_units)) * fetch_byte_units)
         if end_fetch == 0:
             end_fetch = num_bytes
+        # Just makes sense to pull more, and omit the additional header fetch
+        if start_fetch < fetch_byte_units:
+            start_fetch = 0
         print("Byte Range %d:%d" % (start_fetch, end_fetch))
 
         # Get the header from the CSV file
@@ -223,7 +226,6 @@ class SQLQuery():
         else:
             print("Loading customer header and dropping first column")
             result_df = pd.read_csv(body, header=None, names=header)
-        # if start_fetch > 0:
             result_df.drop(result_df.index[[0]], inplace=True)
         if end_fetch < num_bytes:
             print("Dropping last column")
@@ -234,12 +236,62 @@ class SQLQuery():
 
         cut_front = start_rec - first_rec
         cut_back = end_rec - last_rec
-        print("Dropping columns: %d and %d" % (cut_front, cut_back))
+        print("Dropping rows: %d and %d" % (cut_front, cut_back))
         if first_rec > 0:
             result_df.drop(result_df.index[range(cut_front)], inplace=True)
         if end_rec > 0:
             result_df.drop(result_df.index[range(cut_back,0)], inplace=True)
+        print("Have records %d to %d" % (first_rec, last_rec))
+        old_end_fetch = end_fetch
+        old_start_fetch = start_fetch
+        old_last_rec = last_rec
+        while cut_front < 0:
+            print("Need more records at the beginning")
+            end_fetch = min(start_fetch+fetch_bytes, num_bytes)
+            start_fetch = max(0,start_fetch-fetch_bytes)
+            next_df, first_rec, last_rec = self.__get_result_internal(cos_client, result_object, start_rec, first_rec-1, start_fetch, end_fetch, num_bytes, result_df.columns.values, index_column)
+            print("Have records %d to %d" % (first_rec, last_rec))
+            cut_front = start_rec - first_rec
+            result_df = next_df.append(result_df)
+        end_fetch = old_end_fetch
+        start_fetch = old_start_fetch
+        last_rec = old_last_rec
+        while cut_back > 0:
+            print("Need more records at the end")
+            start_fetch = max(0,end_fetch-fetch_bytes)
+            end_fetch = min(end_fetch+fetch_bytes, num_bytes)
+            next_df, first_rec, last_rec = self.__get_result_internal(cos_client, result_object, last_rec+1, end_rec, start_fetch, end_fetch, num_bytes, result_df.columns.values, index_column)
+            print("Have records %d to %d" % (first_rec, last_rec))
+            cut_back = end_rec - last_rec
+            result_df = result_df.append(next_df)
         return result_df
+
+    def __get_result_internal(self, cos_client, result_object, start_rec, end_rec, start_fetch, end_fetch, num_bytes, header, index_column):
+        print("Fetching byte range %d-%d" % (start_fetch, end_fetch))
+        body = cos_client.get_object(Bucket=self.target_cos_bucket, Key=result_object, Range="bytes=%d-%d" % (start_fetch, end_fetch))['Body']
+        if not hasattr(body, "__iter__"): body.__iter__ = types.MethodType(self.__iter__, body)
+        print("Passed in header", header)
+        if start_fetch == 0:
+            result_df = pd.read_csv(body)
+        else:
+            print("Loading custom header and dropping first row")
+            result_df = pd.read_csv(body, header=None, names=header)
+            result_df.drop(result_df.index[[0]], inplace=True)
+        if end_fetch < num_bytes:
+            print("Dropping last row")
+            result_df.drop(result_df.index[[-1]], inplace=True)
+            first_rec = int(result_df.iloc[0][index_column])
+        last_rec = int(result_df.iloc[-1][index_column])
+
+        cut_front = start_rec - first_rec
+        cut_back = end_rec - last_rec
+        print("Records successfully fetched: %d - %d" % (first_rec, last_rec))
+        print("Dropping rows: %d and %d" % (cut_front, cut_back))
+        if first_rec > 0:
+            result_df.drop(result_df.index[range(cut_front)], inplace=True)
+        if end_rec > 0:
+            result_df.drop(result_df.index[range(cut_back,0)], inplace=True)
+        return result_df, first_rec, last_rec
 
     def delete_result(self, jobId):
         if not self.logged_on:
